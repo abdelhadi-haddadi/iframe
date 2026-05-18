@@ -1,0 +1,6 @@
+{
+  "name": "Editorial Showcase AI",
+  "description": "Transform any website into a premium luxury editorial composition automatically using AI and automated screenshot analysis.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

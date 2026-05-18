@@ -16,7 +16,30 @@ app.use(express.json({ limit: '50mb' }));
 
 const genAI = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY || '',
+  httpOptions: {
+    headers: {
+      'User-Agent': 'aistudio-build',
+    }
+  }
 });
+
+// Helper to call Gemini with retry
+async function generateContentWithRetry(params: any, retries = 3, delay = 2000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await genAI.models.generateContent(params);
+    } catch (error: any) {
+      const isUnavailable = error.message?.includes('503') || error.status === 503 || error.code === 503;
+      if (isUnavailable && i < retries - 1) {
+        console.warn(`Gemini API 503 error, retrying in ${delay}ms... (Attempt ${i + 1}/${retries})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        delay *= 2; // Exponential backoff
+        continue;
+      }
+      throw error;
+    }
+  }
+}
 
 // Helper to get screenshots via Microlink
 async function getScreenshot(url: string, mode: 'desktop' | 'mobile'): Promise<string> {
@@ -86,7 +109,7 @@ app.post("/api/analyze", async (req, res) => {
     - glowColor: A vibrant accent color from the theme to use for atmospheric glow (hex)
     `;
 
-    const aiResponse = await genAI.models.generateContent({
+    const aiResponse = await generateContentWithRetry({
       model: "gemini-3-flash-preview",
       contents: prompt,
       config: {
@@ -106,6 +129,10 @@ app.post("/api/analyze", async (req, res) => {
         }
       }
     });
+
+    if (!aiResponse) {
+      throw new Error("Failed to get response from Gemini after retries.");
+    }
 
     const aiPlan = JSON.parse(aiResponse.text || '{}');
 

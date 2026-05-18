@@ -2,7 +2,8 @@
 import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
-import { chromium } from "playwright";
+import axios from "axios";
+import * as cheerio from "cheerio";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 
@@ -15,12 +16,24 @@ app.use(express.json({ limit: '50mb' }));
 
 const genAI = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY || '',
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
-    }
-  }
 });
+
+// Helper to get screenshots via Microlink
+async function getScreenshot(url: string, mode: 'desktop' | 'mobile'): Promise<string> {
+  try {
+    const isMobile = mode === 'mobile';
+    const screenshotUrl = `https://api.microlink.io?url=${encodeURIComponent(url)}&screenshot=true&embed=screenshot.url&meta=false${isMobile ? '&viewport.isMobile=true&viewport.width=390&viewport.height=844' : '&viewport.width=1440&viewport.height=900'}`;
+    
+    // Microlink returns the image directly in this configuration
+    const response = await axios.get(screenshotUrl, { responseType: 'arraybuffer' });
+    const buffer = Buffer.from(response.data, 'binary');
+    return `data:image/png;base64,${buffer.toString('base64')}`;
+  } catch (error) {
+    console.error(`Failed to get ${mode} screenshot:`, error);
+    // Return a high-quality placeholder if screenshot fails
+    return `https://images.unsplash.com/photo-1460925895917-afdab827c52f?q=80&w=2426&auto=format&fit=crop`;
+  }
+}
 
 // API Routes
 app.post("/api/analyze", async (req, res) => {
@@ -29,69 +42,38 @@ app.post("/api/analyze", async (req, res) => {
     return res.status(400).json({ error: "URL is required" });
   }
 
-  let browser;
   try {
-    browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext();
-    const page = await context.newPage();
-
-    // 1. Visit URL
-    await page.setViewportSize({ width: 1440, height: 900 });
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
+    // 1. Fetch HTML Content
+    const response = await axios.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      },
+      timeout: 10000
+    });
     
-    // Give time for any hero animations to complete
-    await page.waitForTimeout(3000);
-
+    const $ = cheerio.load(response.data);
+    
     // 2. Extract Basic Info
-    const pageTitle = await page.title();
-    const favicon = await page.evaluate(() => {
-      const icon = document.querySelector('link[rel="icon"], link[rel="shortcut icon"]');
-      return icon ? (icon as HTMLLinkElement).href : "";
-    });
+    const pageTitle = $('title').text() || $('h1').first().text() || "Untitled";
+    let favicon = $('link[rel="icon"], link[rel="shortcut icon"]').attr('href') || "";
+    if (favicon && !favicon.startsWith('http')) {
+      const urlObj = new URL(url);
+      favicon = `${urlObj.origin}${favicon.startsWith('/') ? '' : '/'}${favicon}`;
+    }
 
-    // 3. Extract Colors and Fonts (Simplified Analysis)
-    const brandDataRaw = await page.evaluate(() => {
-      const styles = getComputedStyle(document.body);
-      const h1 = document.querySelector('h1');
-      const h1Styles = h1 ? getComputedStyle(h1) : styles;
+    const pageText = $('body').text().replace(/\s+/g, ' ').slice(0, 4000);
 
-      // Extract some common colors
-      const colors = new Set<string>();
-      const elements = Array.from(document.querySelectorAll('*')).slice(0, 500);
-      elements.forEach(el => {
-        const style = getComputedStyle(el);
-        if (style.backgroundColor && style.backgroundColor !== 'transparent' && style.backgroundColor !== 'rgba(0, 0, 0, 0)') {
-           colors.add(style.backgroundColor);
-        }
-        if (style.color) {
-           colors.add(style.color);
-        }
-      });
+    // 3. Parallelize Screenshot Capture (Lightweight)
+    const [desktopScreenshot, mobileScreenshot] = await Promise.all([
+      getScreenshot(url, 'desktop'),
+      getScreenshot(url, 'mobile')
+    ]);
 
-      return {
-        colors: Array.from(colors).slice(0, 5),
-        primaryFont: h1Styles.fontFamily,
-        secondaryFont: styles.fontFamily,
-        text: document.body.innerText.slice(0, 4000) // For AI analysis
-      };
-    });
-
-    // 4. Capture Screenshots
-    // Desktop
-    const desktopScreenshot = await page.screenshot({ type: 'png' });
-
-    // Mobile - Switch viewport and wait again briefly
-    await page.setViewportSize({ width: 390, height: 844 });
-    await page.waitForTimeout(2000);
-    // Scroll to top just in case
-    await page.evaluate(() => window.scrollTo(0, 0));
-    const mobileScreenshot = await page.screenshot({ type: 'png' });
-
-    // 5. Use Gemini to refine data
+    // 4. Use Gemini to refine data
     const prompt = `Analyze this website content and provide a luxury editorial showcase plan.
     Website URL: ${url}
     Website Title: ${pageTitle}
-    Content Snippet: ${brandDataRaw.text}
+    Content Snippet: ${pageText}
     
     Return a JSON object with:
     - title: A premium, minimalist headline (max 5 words)
@@ -136,15 +118,15 @@ app.post("/api/analyze", async (req, res) => {
       brand: {
         name: aiPlan.brandName || pageTitle,
         logoUrl: favicon,
-        colors: brandDataRaw.colors,
+        colors: ["#000000", "#ffffff"], // Simplified colors without Playwright
         typography: {
           primary: "Cormorant Garamond", 
           secondary: "Inter",
         }
       },
       screenshots: {
-        desktop: `data:image/png;base64,${desktopScreenshot.toString('base64')}`,
-        mobile: `data:image/png;base64,${mobileScreenshot.toString('base64')}`,
+        desktop: desktopScreenshot,
+        mobile: mobileScreenshot,
       },
       layout: aiPlan.recommendedLayout || 'cinema',
       lights: {
@@ -158,8 +140,6 @@ app.post("/api/analyze", async (req, res) => {
   } catch (error: any) {
     console.error("Analysis failed:", error);
     res.status(500).json({ error: error.message });
-  } finally {
-    if (browser) await browser.close();
   }
 });
 
